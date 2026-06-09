@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>GPS Speedometer & Logger</title>
+    
+    <link rel="icon" type="image/png" href="./logo.png">
+    <link rel="manifest" href="./manifest.json">
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js').catch(() => console.log("Service worker not active yet."));
+            });
+        }
+    </script>
+
+    <style>
+        :root {
+            --primary: #3b82f6; /* Bright Blue */
+            --danger: #ef4444;  /* Red for Stop */
+            --bg-glass: rgba(15, 23, 42, 0.8);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+        body { background-color: #000; color: var(--text-main); height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; }
+
+        /* Dashboard UI */
+        .dashboard {
+            background: var(--bg-glass);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 24px;
+            padding: 40px 20px;
+            width: 90%;
+            max-width: 400px;
+            text-align: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        /* Speed Display */
+        .speed-circle {
+            width: 220px;
+            height: 220px;
+            border-radius: 50%;
+            border: 8px solid #1e293b;
+            border-top-color: var(--primary);
+            margin: 0 auto 20px auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.2);
+        }
+
+        .speed-value { font-size: 4.5rem; font-weight: bold; line-height: 1; }
+        .speed-unit { font-size: 1.2rem; color: var(--text-muted); margin-top: 5px; }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .stat-box { background: rgba(0,0,0,0.4); padding: 15px; border-radius: 12px; }
+        .stat-label { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 5px; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: var(--primary); }
+
+        /* Buttons & Status */
+        button {
+            width: 100%;
+            padding: 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: white;
+            background: var(--primary);
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        button.tracking { background: var(--danger); }
+        
+        #status-text { margin-top: 15px; font-size: 0.9rem; color: var(--text-muted); height: 20px; }
+        
+        /* Utility */
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard">
+        <div class="speed-circle">
+            <div class="speed-value" id="current-speed">0</div>
+            <div class="speed-unit">km/h</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-label">TRIP DISTANCE</div>
+                <div class="stat-value"><span id="trip-dist">0.00</span> <span style="font-size: 0.9rem;">km</span></div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">TOP SPEED</div>
+                <div class="stat-value"><span id="top-speed">0</span> <span style="font-size: 0.9rem;">km/h</span></div>
+            </div>
+        </div>
+
+        <button id="action-btn" onclick="toggleTracking()">Start Trip</button>
+        <div id="status-text">GPS Ready</div>
+    </div>
+
+    <script>
+        // App State
+        let state = {
+            isTracking: false,
+            watchId: null,
+            totalDistance: 0, // in kilometers
+            topSpeed: 0,      // in km/h
+            lastPosition: null // stores {lat, lon}
+        };
+
+        const els = {
+            btn: document.getElementById('action-btn'),
+            status: document.getElementById('status-text'),
+            speed: document.getElementById('current-speed'),
+            dist: document.getElementById('trip-dist'),
+            topSpd: document.getElementById('top-speed'),
+            circle: document.querySelector('.speed-circle')
+        };
+
+        // Standard Math functions for Haversine
+        function toRadians(degrees) {
+            return degrees * (Math.PI / 180);
+        }
+
+        // The Haversine Formula (returns distance in km)
+        function calculateDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371; // Earth radius in km
+            const dLat = toRadians(lat2 - lat1);
+            const dLon = toRadians(lon2 - lon1);
+            
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) *
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c; 
+        }
+
+        function toggleTracking() {
+            if (state.isTracking) {
+                stopTracking();
+            } else {
+                startTracking();
+            }
+        }
+
+        function startTracking() {
+            if (!navigator.geolocation) {
+                els.status.textContent = "Error: Geolocation not supported.";
+                return;
+            }
+
+            // Reset trip stats
+            state.totalDistance = 0;
+            state.topSpeed = 0;
+            state.lastPosition = null;
+            updateUI(0);
+
+            els.btn.textContent = "Stop Trip";
+            els.btn.classList.add('tracking');
+            els.status.textContent = "Acquiring GPS signal...";
+            els.circle.style.borderTopColor = "var(--danger)"; // Change ring to red when active
+            state.isTracking = true;
+
+            // Start actively watching GPS hardware
+            state.watchId = navigator.geolocation.watchPosition(
+                handlePositionUpdate, 
+                handleError, 
+                {
+                    enableHighAccuracy: true, // Forces phone to use real GPS chip, not Wi-Fi guessing
+                    maximumAge: 0,
+                    timeout: 5000
+                }
+            );
+        }
+
+        function stopTracking() {
+            if (state.watchId !== null) {
+                navigator.geolocation.clearWatch(state.watchId);
+            }
+            state.isTracking = false;
+            els.btn.textContent = "Start New Trip";
+            els.btn.classList.remove('tracking');
+            els.status.textContent = "Trip Paused.";
+            els.circle.style.borderTopColor = "var(--primary)";
+            els.speed.textContent = "0"; // Reset live speed gauge to zero
+        }
+
+        function handlePositionUpdate(position) {
+            els.status.textContent = "Tracking active...";
+
+            // 1. Process Speed (API gives speed in meters/second, convert to km/h)
+            let rawSpeed = position.coords.speed;
+            let currentSpeedKmh = 0;
+            
+            if (rawSpeed !== null && rawSpeed > 0) {
+                currentSpeedKmh = rawSpeed * 3.6; 
+            }
+
+            // 2. Update Top Speed
+            if (currentSpeedKmh > state.topSpeed) {
+                state.topSpeed = currentSpeedKmh;
+            }
+
+            // 3. Process Distance using Haversine
+            let currentPos = {
+                lat: position.coords.latitude,
+                lon: position.coords.longitude
+            };
+
+            if (state.lastPosition !== null) {
+                let distAdded = calculateDistance(
+                    state.lastPosition.lat, state.lastPosition.lon,
+                    currentPos.lat, currentPos.lon
+                );
+                
+                // Only add distance if it's a realistic movement (filters out GPS jitter)
+                if (distAdded > 0.002) { 
+                    state.totalDistance += distAdded;
+                }
+            }
+            
+            state.lastPosition = currentPos;
+
+            // 4. Draw to screen
+            updateUI(currentSpeedKmh);
+        }
+
+        function updateUI(speedKmh) {
+            els.speed.textContent = Math.round(speedKmh);
+            els.topSpd.textContent = Math.round(state.topSpeed);
+            els.dist.textContent = state.totalDistance.toFixed(2);
+        }
+
+        function handleError(error) {
+            console.error(error);
+            switch(error.code) {
+                case error.PERMISSION_DENIED:
+                    els.status.textContent = "Error: Location permission denied.";
+                    stopTracking();
+                    break;
+                case error.POSITION_UNAVAILABLE:
+                    els.status.textContent = "GPS signal lost...";
+                    els.speed.textContent = "0";
+                    break;
+                case error.TIMEOUT:
+                    els.status.textContent = "Searching for satellites...";
+                    break;
+            }
+        }
+    </script>
+</body>
+</html>
